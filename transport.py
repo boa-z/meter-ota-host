@@ -1,11 +1,65 @@
-"""复用 python-can、can-isotp 与 udsoncan，不实现标准传输协议。"""
+"""复用 python-can、can-isotp 与 udsoncan，不实现标准传输协议。
+
+DID 契约见固件 protocols/uds/meter_uds_did.h；这里只做定长解码，不做旧协议兼容。
+"""
 from contextlib import contextmanager
 import copy
-import json
 import threading
 import time
 
-DID = 0xf180
+DID_MANIFEST = 0xFD10
+DID_STATUS = 0xFD11
+DID_ENDPOINT = 0xFD12
+DID_SESSION = 0xF186
+DID_HARDWARE = 0xF192
+DID_SOFTWARE = 0xF195
+
+MANIFEST_SIZE = 148
+STATUS_SIZE = 12
+ENDPOINT_SIZE = 164
+HARDWARE_SIZE = 32
+SOFTWARE_SIZE = 48
+
+# 与固件 state_code 表一一对应；编号是线协议的一部分，不能随固件枚举重排。
+STATE_NAMES = ("IDLE", "DOWNLOADING", "TRANSFERRED", "VERIFYING", "CANDIDATE_READY", "WAIT_DURABLE",
+               "ACTIVATING", "ACTIVATED", "CONFIRMED", "ABORTED", "FAILED")
+
+FLAG_BACKEND_SUPPORTED = 1 << 0
+FLAG_MAINTENANCE = 1 << 1
+FLAG_EXCLUSIVE = 1 << 2
+FLAG_ADMISSION = 1 << 3
+FLAG_MANIFEST_PRESENT = 1 << 4
+FLAG_CANDIDATE_VERIFIED = 1 << 5
+
+
+def _text(raw):
+    """定长 ASCII 字段：NUL 终止，其余为填充。"""
+    return raw.split(b"\0", 1)[0].decode("ascii", "replace")
+
+
+def _manifest(raw):
+    return {"product": _text(raw[0:32]), "hardware": _text(raw[32:64]), "version": _text(raw[64:112]),
+            "size": int.from_bytes(raw[112:116], "big"), "sha256": raw[116:148].hex()}
+
+
+def _status(raw):
+    flags = raw[2]
+    return {"state": STATE_NAMES[raw[0]] if raw[0] < len(STATE_NAMES) else "UNKNOWN",
+            "state_code": raw[0], "error": raw[1],
+            "backend_supported": bool(flags & FLAG_BACKEND_SUPPORTED),
+            "maintenance": bool(flags & FLAG_MAINTENANCE),
+            "exclusive": bool(flags & FLAG_EXCLUSIVE),
+            "admission": bool(flags & FLAG_ADMISSION),
+            "manifest_present": bool(flags & FLAG_MANIFEST_PRESENT),
+            "candidate_verified": bool(flags & FLAG_CANDIDATE_VERIFIED),
+            "received": int.from_bytes(raw[4:8], "big"), "total": int.from_bytes(raw[8:12], "big")}
+
+
+def _endpoint(raw):
+    return {"product": _text(raw[0:32]), "hardware": _text(raw[32:64]), "version": _text(raw[64:112]),
+            "os_file": _text(raw[112:128]),
+            "candidate_capacity": int.from_bytes(raw[128:132], "big"),
+            "backend_reason": _text(raw[132:164])}
 
 
 class UdsClient:
@@ -13,13 +67,32 @@ class UdsClient:
         self.client = client
 
     def info(self):
-        return json.loads(self.client.read_data_by_identifier_first(DID))
+        """低频：一次多 DID 请求取回身份、状态与候选 Manifest。"""
+        response = self.client.read_data_by_identifier([DID_ENDPOINT, DID_STATUS, DID_MANIFEST])
+        values = response.service_data.values
+        info = _endpoint(values[DID_ENDPOINT])
+        info.update(_status(values[DID_STATUS]))
+        manifest = _manifest(values[DID_MANIFEST])
+        info["target"] = manifest["version"]
+        info["size"] = manifest["size"]
+        info["sha256"] = manifest["sha256"]
+        info["manifest_product"] = manifest["product"]
+        info["manifest_hardware"] = manifest["hardware"]
+        return info
+
+    def status(self):
+        """高频：只读 12B 状态，不拉 Manifest 与 Endpoint。"""
+        return _status(self.client.read_data_by_identifier_first(DID_STATUS))
+
+    def software_version(self):
+        """重启后轻量确认当前运行的软件版本。"""
+        return _text(self.client.read_data_by_identifier_first(DID_SOFTWARE))
 
     def programming(self):
         self.client.change_session(2)
 
     def manifest(self, payload):
-        self.client.write_data_by_identifier(DID, payload)
+        self.client.write_data_by_identifier(DID_MANIFEST, payload)
 
     def begin(self, size):
         from udsoncan import MemoryLocation
@@ -54,15 +127,26 @@ def connect(channel, interface, bitrate, evidence, request_id=0x7e0, response_id
     from udsoncan.configs import default_client_config
     from udsoncan.connections import PythonIsoTpConnection
 
-    class BytesCodec(DidCodec):
+    class FixedCodec(DidCodec):
+        """定长 DID：长度即契约，禁止用 ReadAllRemainingData 猜多 DID 边界。"""
+
+        def __init__(self, size):
+            self.size = size
+
         def encode(self, value):
-            return bytes(value)
+            data = bytes(value)
+            if len(data) != self.size:
+                raise ValueError("DID payload must be exactly %d bytes" % self.size)
+            return data
 
         def decode(self, value):
-            return bytes(value)
+            data = bytes(value)
+            if len(data) != self.size:
+                raise ValueError("DID response must be exactly %d bytes, got %d" % (self.size, len(data)))
+            return data
 
         def __len__(self):
-            raise self.ReadAllRemainingData()
+            return self.size
 
     bus = None
     tasks = []
@@ -110,8 +194,13 @@ def connect(channel, interface, bitrate, evidence, request_id=0x7e0, response_id
                     "rate_limit_window_size": 0.1})
         config = dict(default_client_config)
         # 同步连接等待完整 ISO-TP PDU；固定有界预算覆盖 1024 字节和 5 ms STmin。
-        config.update(data_identifiers={DID: BytesCodec()}, request_timeout=120,
-                      p2_timeout=2, p2_star_timeout=120, use_server_timing=False)
+        config.update(data_identifiers={DID_MANIFEST: FixedCodec(MANIFEST_SIZE),
+                                        DID_STATUS: FixedCodec(STATUS_SIZE),
+                                        DID_ENDPOINT: FixedCodec(ENDPOINT_SIZE),
+                                        DID_SESSION: FixedCodec(1),
+                                        DID_HARDWARE: FixedCodec(HARDWARE_SIZE),
+                                        DID_SOFTWARE: FixedCodec(SOFTWARE_SIZE)},
+                      request_timeout=120, p2_timeout=2, p2_star_timeout=120, use_server_timing=False)
         with Client(PythonIsoTpConnection(stack), config=config) as client:
             yield UdsClient(client)
     finally:

@@ -18,13 +18,26 @@ class Device:
         self.m = manifest
         self.calls = []
         self.received = bytearray()
-        self.status = {"backend_supported": True, "maintenance": True, "product": manifest.product,
+        self.state = {"backend_supported": True, "maintenance": True, "product": manifest.product,
                        "hardware": manifest.hardware, "state": "IDLE", "error": 0,
-                       "os_file": POLICY.os_file, "candidate_capacity": POLICY.candidate_capacity}
+                       "os_file": POLICY.os_file, "candidate_capacity": POLICY.candidate_capacity,
+                       "manifest_present": False, "candidate_verified": False,
+                       "target": "", "size": 0, "sha256": ""}
         self.fail_block = False
 
     def info(self):
-        return dict(self.status)
+        return dict(self.state)
+
+    def status(self):
+        return {"state": self.state["state"], "error": self.state["error"],
+                "maintenance": self.state["maintenance"],
+                "backend_supported": self.state["backend_supported"],
+                "manifest_present": self.state["manifest_present"],
+                "candidate_verified": self.state["candidate_verified"],
+                "received": self.state.get("received", 0), "total": self.state.get("total", 0)}
+
+    def software_version(self):
+        return self.state["version"]
 
     def programming(self):
         self.calls.append("session")
@@ -48,14 +61,16 @@ class Device:
 
     def finish(self):
         self.calls.append("finish")
-        self.status.update(state="CANDIDATE_READY", target=self.m.version, received=len(self.received))
+        self.state.update(state="CANDIDATE_READY", target=self.m.version, received=len(self.received),
+                           total=self.m.size, size=self.m.size, sha256=self.m.sha256,
+                           manifest_present=True, candidate_verified=True)
 
     def abort(self):
         self.calls.append("abort")
 
     def activate(self):
         self.calls.append("activate")
-        self.status["state"] = "ACTIVATED"
+        self.state["state"] = "ACTIVATED"
 
     def reboot(self):
         self.calls.append("reboot")
@@ -90,7 +105,7 @@ def test_download_wrap_and_explicit_activation(package):
 def test_admission_before_any_mutation(package, field, value):
     path, m = package
     d = Device(m)
-    d.status[field] = value
+    d.state[field] = value
     with pytest.raises(UpdateError):
         download(d, path, m, package_policy=POLICY)
     assert not d.calls
@@ -134,7 +149,7 @@ def test_wrong_activation_target_and_missing_candidate(package):
     with pytest.raises(UpdateError):
         activate(d, "v2", True)
     assert not d.calls
-    d.status.update(state="CANDIDATE_READY", target="v3")
+    d.state.update(state="CANDIDATE_READY", target="v3")
     with pytest.raises(UpdateError):
         activate(d, "v2", True)
     assert not d.calls
@@ -168,8 +183,22 @@ def test_virtual_can_roundtrip_and_evidence(tmp_path):
                          txid=0x7e8, rxid=0x7e0), params={"stmin": 5, "blocksize": 8})
     stop = threading.Event()
     errors = []
-    expected = {"product": "synthetic", "backend_supported": False,
-                "backend_reason": "fixture" * 90, "state": "IDLE"}
+
+    def text(value, size):
+        return value.encode("ascii").ljust(size, b"\0")
+
+    endpoint = (text("synthetic", 32) + text("reference-board", 32) + text("v1", 48) +
+                text("d13x_os.itb", 16) + (4096).to_bytes(4, "big") + text("fixture", 32))
+    status = bytes([0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    response = (b"\x62\xfd\x12" + endpoint + b"\xfd\x11" + status + b"\xfd\x10" + bytes(148))
+    expected = {"product": "synthetic", "hardware": "reference-board", "version": "v1",
+                "os_file": "d13x_os.itb", "candidate_capacity": 4096, "backend_reason": "fixture",
+                "state": "IDLE", "state_code": 0, "error": 0, "backend_supported": True,
+                "maintenance": False, "exclusive": False, "admission": False,
+                "manifest_present": False, "candidate_verified": False, "received": 0, "total": 0,
+                "target": "", "size": 0, "sha256": "00" * 32,
+                "manifest_product": "", "manifest_hardware": ""}
+
     def responder():
         try:
             while not stop.is_set():
@@ -178,8 +207,15 @@ def test_virtual_can_roundtrip_and_evidence(tmp_path):
                     if payload == bytes.fromhex("1002"):
                         stack.send(bytes.fromhex("5002009604b0"))
                         continue
-                    assert payload == bytes.fromhex("22f180")
-                    stack.send(bytes.fromhex("62f180") + json.dumps(expected).encode())
+                    if payload == bytes.fromhex("22fd11"):
+                        stack.send(b"\x62\xfd\x11" + status)
+                        continue
+                    if payload == bytes.fromhex("22f195"):
+                        stack.send(b"\x62\xf1\x95" + text("v1", 48))
+                        continue
+                    # 一次多 DID 请求：FD12 身份 + FD11 状态 + FD10 Manifest。
+                    assert payload == bytes.fromhex("22fd12fd11fd10")
+                    stack.send(response)
         except BaseException as exc:
             errors.append(exc)
     stack.start()
@@ -190,6 +226,8 @@ def test_virtual_can_roundtrip_and_evidence(tmp_path):
         with connect(channel, "virtual", 500000, log, periodic=[(can.Message(arbitration_id=0x123, is_extended_id=False, data=[1]), .05)]) as client:
             client.programming()
             assert client.info() == expected
+            assert client.status()["state"] == "IDLE"
+            assert client.software_version() == "v1"
     finally:
         stop.set()
         thread.join(timeout=2)
@@ -212,19 +250,19 @@ class Trial:
     """试运行确认只对报告槽位与试运行状态的端点有意义；其余端点必须如实失败而不是假装确认。"""
 
     def __init__(self, **info):
-        self.status = {"version": "v2", "slot": "B", "next": "B", "trial": 1}
-        self.status.update(info)
+        self.state = {"version": "v2", "slot": "B", "next": "B", "trial": 1}
+        self.state.update(info)
         self.calls = []
 
     def info(self):
-        return dict(self.status)
+        return dict(self.state)
 
     def programming(self):
         self.calls.append("session")
 
     def confirm(self):
         self.calls.append("confirm")
-        self.status["trial"] = 0
+        self.state["trial"] = 0
 
 
 def test_confirm_clears_an_unconfirmed_trial():
@@ -251,7 +289,7 @@ def test_endpoint_without_trial_state_cannot_be_confirmed():
     class Plain(Trial):
         def __init__(self):
             super().__init__()
-            self.status = {"version": "v2"}
+            self.state = {"version": "v2"}
     device = Plain()
     with pytest.raises(UpdateError):
         confirm(device, "v2")

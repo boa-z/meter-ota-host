@@ -6,7 +6,7 @@
 """
 from pathlib import Path
 import time
-from .client import Manifest, UpdateError, activate, confirm, download, preflight
+from .client import Manifest, UpdateError, activate, candidate_matches, confirm, download, preflight
 from .package import PackagePolicy
 
 DEFAULT_MAINTENANCE_COMMAND = "meter_update maintenance on"
@@ -62,8 +62,12 @@ def run(client, package, manifest_path, *, os_file, candidate_capacity=None, say
         say("已取消，设备没有被改动。")
         return {"event": "cancelled"}
 
-    resumed = info.get("target") == manifest.version
     state = info.get("state")
+    # 版本号相同不代表内容相同：保留的候选必须与目标包逐字段一致才允许续做。
+    resumed = candidate_matches(info, manifest)
+    if (state in READY_STATES or state == "ACTIVATED") and not resumed:
+        raise UpdateError("设备上已存在 %s 的候选，但内容与升级包不一致。"
+                          "请先在设备上按现有 Abort 流程清除后重试。" % info.get("target", "未知版本"))
     if resumed and state == "ACTIVATED":
         step(3, "跳过：设备已激活该版本，只差重启")
         step(4, "跳过：升级包已在设备上")
@@ -82,11 +86,11 @@ def run(client, package, manifest_path, *, os_file, candidate_capacity=None, say
         else:
             raise UpdateError("设备升级状态是 %s，不能直接开始。先用 abort 命令中止后重试。" % state)
         step(5, "激活并重启")
-        emit(activate(client, manifest.version, reboot=True))
+        emit(activate(client, manifest.version, reboot=True, manifest=manifest))
 
     step(6, "等待设备以新版本重新上线并校验")
-    after = _wait_new_version(client, manifest, boot_timeout, say, clock, sleep)
-    return _verify(client, manifest, after, say, emit)
+    _wait_new_version(client, manifest, boot_timeout, say, clock, sleep)
+    return _verify(client, manifest, say, emit)
 
 
 def _enter_maintenance(client, info, wait, command, say, clock, sleep):
@@ -103,8 +107,9 @@ def _enter_maintenance(client, info, wait, command, say, clock, sleep):
     asked_at = clock()
     announced = False
     while True:
-        info = client.info()  # 同时让编程会话保持有效
-        if info.get("maintenance") in (True, 1):
+        # 高频轮询只读 12B 状态，同时让编程会话保持有效。
+        status = client.status()
+        if status.get("maintenance") in (True, 1):
             say("      维护模式已开启" + ("（经 CAN 编程会话）" if not announced else ""))
             return
         if not announced and clock() - asked_at >= 3:
@@ -135,15 +140,15 @@ def _download(client, package, manifest, policy, say, emit):
 
 
 def _wait_new_version(client, manifest, timeout, say, clock, sleep):
+    """重启期间只读 F195（当前运行版本），比拉取完整设备信息轻。"""
     deadline = clock() + timeout
     start = clock()
     sleep(3)  # 给设备留出开始重启的时间，避免读到重启前的旧状态
     told = 0
     while True:
         try:
-            info = client.info()
-            if info.get("version") == manifest.version:
-                return info
+            if client.software_version() == manifest.version:
+                return
         except Exception:
             pass  # 重启期间设备不应答是正常的
         waited = int(clock() - start)
@@ -156,7 +161,8 @@ def _wait_new_version(client, manifest, timeout, say, clock, sleep):
         sleep(1)
 
 
-def _verify(client, manifest, info, say, emit):
+def _verify(client, manifest, say, emit):
+    info = client.info()
     checks = [
         ("运行版本", info.get("version") == manifest.version, "设备上报 %s" % info.get("version")),
         ("产品与硬件", info.get("product") == manifest.product and info.get("hardware") == manifest.hardware,

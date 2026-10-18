@@ -80,6 +80,14 @@ def require_device(info, manifest=None):
         raise UpdateError("device Product/Hardware mismatch")
 
 
+def candidate_matches(info, manifest):
+    """候选必须与目标包逐字段一致；版本号相同不代表内容相同。"""
+    return (info.get("manifest_present") is True and info.get("candidate_verified") is True and
+            info.get("target") == manifest.version and info.get("size") == manifest.size and
+            info.get("sha256") == manifest.sha256 and
+            info.get("product") == manifest.product and info.get("hardware") == manifest.hardware)
+
+
 def download(client, path, manifest, emit=lambda event: None, block_size=512, *, package_policy=None):
     if type(block_size) is not int or not 1 <= block_size <= 512:
         raise UpdateError("block size must be in 1..512")
@@ -120,10 +128,12 @@ def download(client, path, manifest, emit=lambda event: None, block_size=512, *,
             client.finish()
             after = client.info()
             if (after.get("state") != "CANDIDATE_READY" or after.get("target") != manifest.version or
-                    after.get("received") != manifest.size or after.get("error") != 0):
+                    after.get("received") != manifest.size or after.get("error") != 0 or
+                    after.get("size") != manifest.size or after.get("sha256") != manifest.sha256):
                 emit({"event": "verify_mismatch", "device": after,
                       "want": {"state": "CANDIDATE_READY", "target": manifest.version,
-                               "received": manifest.size, "error": 0}})
+                               "received": manifest.size, "size": manifest.size,
+                               "sha256": manifest.sha256, "error": 0}})
                 raise UpdateError("device did not validate the expected candidate")
             elapsed = time.monotonic() - begin
             result = {"event": "candidate", "device": after, "elapsed_s": elapsed,
@@ -140,11 +150,13 @@ def download(client, path, manifest, emit=lambda event: None, block_size=512, *,
             raise
 
 
-def activate(client, version, reboot=False):
+def activate(client, version, reboot=False, manifest=None):
     info = client.info()
     require_device(info)
     if info.get("target") != version or info.get("state") not in ("CANDIDATE_READY", "WAIT_DURABLE"):
         raise UpdateError("expected validated candidate is not present")
+    if manifest is not None and not candidate_matches(info, manifest):
+        raise UpdateError("device candidate does not match the target package")
     client.programming()
     client.activate()
     result = client.info()

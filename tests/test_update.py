@@ -33,22 +33,43 @@ class Board:
         self.session_error = None
         self.uart_after = 0  # 第 N 次读取状态时，操作员在串口打开了维护模式
         self.polls = 0
-        self.status = {"backend_supported": True, "maintenance": True, "product": manifest.product,
+        self.state = {"backend_supported": True, "maintenance": True, "product": manifest.product,
                        "hardware": manifest.hardware, "version": "v1", "state": "IDLE", "error": 0,
-                       "os_file": "d13x_os.itb", "candidate_capacity": CAPACITY}
-        self.status.update(info)
+                       "os_file": "d13x_os.itb", "candidate_capacity": CAPACITY,
+                       "manifest_present": False, "candidate_verified": False,
+                       "target": "", "size": 0, "sha256": "", "received": 0, "total": 0}
+        self.state.update(info)
+        # 已存在候选时，身份字段默认取目标包；测试可显式覆盖来模拟内容不一致。
+        if self.state.get("state") in ("CANDIDATE_READY", "WAIT_DURABLE", "ACTIVATED", "ACTIVATING"):
+            for key, value in (("manifest_present", True), ("candidate_verified", True),
+                               ("target", manifest.version), ("size", manifest.size),
+                               ("sha256", manifest.sha256)):
+                if key not in info:
+                    self.state[key] = value
 
-    def info(self):
+    def _snapshot(self):
         self.polls += 1
         if self.silent_polls > 0 and "reboot" in self.calls:
             self.silent_polls -= 1
             raise TimeoutError("no response while rebooting")
-        status = dict(self.status)
+        status = dict(self.state)
         if self.uart_after and self.polls >= self.uart_after:
             status["maintenance"] = True
         if self.maintenance_after and self.polls <= self.maintenance_after:
             status["maintenance"] = False
         return status
+
+    def info(self):
+        return self._snapshot()
+
+    def status(self):
+        snapshot = self._snapshot()
+        return {key: snapshot.get(key) for key in
+                ("state", "error", "maintenance", "backend_supported", "manifest_present",
+                 "candidate_verified", "received", "total")}
+
+    def software_version(self):
+        return self._snapshot()["version"]
 
     def programming(self):
         self.calls.append("session")
@@ -56,7 +77,7 @@ class Board:
             error, self.session_error = self.session_error, None  # 只拒绝第一次请求
             raise error
         if self.grants:
-            self.status["maintenance"] = True
+            self.state["maintenance"] = True
 
     def manifest(self, data):
         self.calls.append("manifest")
@@ -70,18 +91,24 @@ class Board:
 
     def finish(self):
         self.calls.append("finish")
-        self.status.update(state="CANDIDATE_READY", target=self.m.version, received=len(self.received))
+        self.state.update(state="CANDIDATE_READY", target=self.m.version, received=len(self.received),
+                           total=self.m.size, size=self.m.size, sha256=self.m.sha256,
+                           manifest_present=True, candidate_verified=True)
 
     def abort(self):
         self.calls.append("abort")
+        self.state.update(state="ABORTED", manifest_present=False, candidate_verified=False,
+                           target="", size=0, sha256="", received=0, total=0)
 
     def activate(self):
         self.calls.append("activate")
-        self.status["state"] = "ACTIVATED"
+        self.state["state"] = "ACTIVATED"
 
     def reboot(self):
         self.calls.append("reboot")
-        self.status.update(version=self.m.version, state="IDLE", maintenance=False)
+        self.state.update(version=self.m.version, state="IDLE", maintenance=False,
+                           manifest_present=False, candidate_verified=False, target="",
+                           size=0, sha256="", received=0, total=0)
 
 
 def write_package(directory, data, manifest):
@@ -222,6 +249,17 @@ def test_resumes_after_activation_by_only_rebooting(case):
     assert result["event"] == "verified" and board.calls == ["session", "reboot"]
 
 
+@pytest.mark.parametrize("override", [{"sha256": "ab" * 32}, {"size": 1},
+                                      {"candidate_verified": False}, {"manifest_present": False}])
+def test_candidate_with_matching_version_but_different_content_is_refused(case, override):
+    """版本号相同不代表内容相同：必须逐字段一致，否则拒绝续做且不写任何东西。"""
+    directory, manifest = case
+    board = Board(manifest, state="CANDIDATE_READY", **override)
+    with pytest.raises(UpdateError, match="不一致"):
+        go(board, directory)
+    assert "begin" not in board.calls and "activate" not in board.calls and "manifest" not in board.calls
+
+
 def test_foreign_session_is_not_taken_over(case):
     directory, manifest = case
     board = Board(manifest, state="RECEIVING", target="other")
@@ -245,11 +283,11 @@ def test_silent_reboot_is_waited_out_and_a_stuck_one_times_out(case):
 def test_failed_post_check_is_an_error_and_open_maintenance_is_a_warning(case):
     directory, manifest = case
     board = Board(manifest)
-    board.reboot = lambda: board.status.update(version="v2", state="IDLE", error=7)
+    board.reboot = lambda: board.state.update(version="v2", state="IDLE", error=7)
     with pytest.raises(UpdateError, match="校验未通过"):
         go(board, directory)
     board = Board(manifest)
-    board.reboot = lambda: board.status.update(version="v2", state="IDLE", maintenance=True)
+    board.reboot = lambda: board.state.update(version="v2", state="IDLE", maintenance=True)
     result, lines, _ = go(board, directory)
     assert result["warnings"] and any("注意" in line and "maintenance off" in line for line in lines)
 
@@ -257,9 +295,9 @@ def test_failed_post_check_is_an_error_and_open_maintenance_is_a_warning(case):
 def test_unsettled_trial_slot_is_confirmed(case):
     directory, manifest = case
     board = Board(manifest)
-    board.reboot = lambda: board.status.update(version="v2", state="IDLE", maintenance=False,
+    board.reboot = lambda: board.state.update(version="v2", state="IDLE", maintenance=False,
                                                slot="B", next="B", trial=1)
-    board.confirm = lambda: board.status.update(trial=0)
+    board.confirm = lambda: board.state.update(trial=0)
     result, lines, _ = go(board, directory)
     assert "confirmation" in result and any("试运行确认" in line for line in lines)
 
@@ -277,34 +315,52 @@ def test_cli_update_end_to_end_over_virtual_can(case, tmp_path, capsys):
     bus = can.Bus(interface="virtual", channel=channel)
     stack = isotp.CanStack(bus=bus, address=isotp.Address(isotp.AddressingMode.Normal_11bits, txid=0x7e8, rxid=0x7e0),
                            params={"stmin": 0, "blocksize": 8})
-    status = {"backend_supported": True, "maintenance": False, "product": manifest.product,
-              "hardware": manifest.hardware, "version": "v1", "state": "IDLE", "error": 0,
-              "os_file": "d13x_os.itb", "candidate_capacity": CAPACITY}
+    state = {"code": 0, "error": 0, "flags": 0x01, "received": 0, "total": 0,
+             "manifest": bytes(148), "version": "v1"}
     stop, errors, received = threading.Event(), [], bytearray()
     silent_until = [0.0]
 
+    def text(value, size):
+        return value.encode("ascii").ljust(size, b"\0")
+
+    def endpoint():
+        return (text(manifest.product, 32) + text(manifest.hardware, 32) + text(state["version"], 48) +
+                text("d13x_os.itb", 16) + CAPACITY.to_bytes(4, "big") + text("native_auto_unverified", 32))
+
+    def status_bytes():
+        return (bytes([state["code"], state["error"], state["flags"], 0]) +
+                state["received"].to_bytes(4, "big") + state["total"].to_bytes(4, "big"))
+
     def respond(request):
         if request == bytes.fromhex("1002"):
-            status["maintenance"] = True  # 编程会话请求维护模式，设备端无准入限制
+            state["flags"] |= 0x02  # 编程会话请求维护模式，设备端无准入限制
             return bytes.fromhex("5002009604b0")
-        if request == bytes.fromhex("22f180"):
-            return bytes.fromhex("62f180") + json.dumps(status).encode()
-        if request[:3] == bytes.fromhex("2ef180"):
-            status["target"] = request[3 + 64:3 + 112].rstrip(bytes(1)).decode()
-            return bytes.fromhex("6ef180")
+        if request == bytes.fromhex("22fd12fd11fd10"):
+            return b"\x62\xfd\x12" + endpoint() + b"\xfd\x11" + status_bytes() + b"\xfd\x10" + state["manifest"]
+        if request == bytes.fromhex("22fd11"):
+            return b"\x62\xfd\x11" + status_bytes()
+        if request == bytes.fromhex("22f195"):
+            return b"\x62\xf1\x95" + text(state["version"], 48)
+        if request[:3] == bytes.fromhex("2efd10"):
+            state["manifest"] = bytes(request[3:])
+            state["total"] = int.from_bytes(state["manifest"][112:116], "big")
+            state["flags"] |= 0x10
+            return bytes.fromhex("6efd10")
         if request[0] == 0x34:
             return bytes.fromhex("742001") + bytes([2])
         if request[0] == 0x36:
             received.extend(request[2:])
+            state["received"] = len(received)
             return bytes([0x76, request[1]])
         if request[0] == 0x37:
-            status.update(state="CANDIDATE_READY", received=len(received))
+            state.update(code=4, received=state["total"])
+            state["flags"] |= 0x20
             return bytes([0x77])
         if request == bytes.fromhex("3101f001"):
-            status["state"] = "ACTIVATED"
+            state["code"] = 7
             return bytes.fromhex("7101f001")
         if request == bytes.fromhex("1101"):
-            status.update(version=status["target"], state="IDLE", maintenance=False)
+            state.update(version=manifest.version, code=0, flags=0x01, received=0, total=0, manifest=bytes(148))
             silent_until[0] = time.monotonic() + 1.0  # 重启期间不应答
             return bytes.fromhex("5101")
         raise AssertionError("unexpected request " + request.hex())
